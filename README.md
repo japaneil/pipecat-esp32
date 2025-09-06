@@ -1,23 +1,15 @@
-# Pipecat ESP32 Client SDK
+# Pipecat ESP32 Client SDK - Bern Technologies
 
 ## 💻 Platform/Device Support
 
-This SDK has been developed and tested on a `esp32s3` and `linux`. You don't
-need any physical hardware to run this SDK, but it will be very limited
-(e.g. you won't hear an audio on Linux).
-
-To use it on hardware purchase any of these microcontrollers. Others may
-work, but this is what has been developed against.
-
-* [Espressif - ESP32-S3-BOX-3](https://www.digikey.com/short/fb2vjrpn)
-* [M5Stack - CoreS3 ESP32S3 loT Development Kit](https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit)
+This SDK has been developed and tested only on a `esp32s3`.
 
 ## 📋 Pre-requisites
 
 Clone this repository:
 
 ```
-git clone --recursive https://github.com/pipecat-ai/pipecat-esp32.git
+git clone --recursive https://github.com/japaneil/pipecat-esp32.git
 ```
 
 Install the ESP-IDF toolchain following these
@@ -28,6 +20,7 @@ After that, just open a terminal and load ESP-IDF tools:
 ```
 source PATH_TO_ESP_IDF/export.sh
 ```
+Or open the ESP-IDF CMD and cd into the `esp32-s3-box-3` directory.
 
 We also need to set a few environment variables before we can build:
 
@@ -51,25 +44,13 @@ The first thing to do is to set the desired target, for example:
 idf.py --preview set-target esp32s3
 ```
 
-You can also set `linux` instead of `esp32s3`.
-
 Then, just build:
 
 ```
 idf.py build
 ```
 
-If you built for `linux` you can run the binary directly:
-
-```
-./build/src.elf
-```
-
 ## 🔌 Flash the device
-
-If you built for `esp32s3` you can flash your device using the following commands:
-
-### Linux
 
 ```
 idf.py -p /dev/ttyACM0 flash
@@ -81,20 +62,6 @@ where `/dev/ttyACM0` is the device where your ESP32 is connected. You can run
 On Debian systems, you will want to add your user to the `dialout` group so you
 don't need root access.
 
-### macOS
-
 ```
 idf.py flash
 ```
-
-## ▶️ Usage
-
-Currently, you can try `pipecat-esp32` with one of the Pipecat foundational
-examples. For example, from the Pipecat repository you can run:
-
-```
-python examples/foundational/07-interruptible.py --host IP --esp32
-```
-
-where `IP` is just your machine IP address (e.g. 192.168.1.10). Then, you would
-set the environment variable `PIPECAT_SMALLWEBRTC_URL` as explained above.
