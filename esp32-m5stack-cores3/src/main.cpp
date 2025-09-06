@@ -26,13 +26,18 @@ extern "C" void app_main(void) {
 
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   peer_init();
+  
+  // Initialize audio components in correct order
   pipecat_init_audio_capture();
   pipecat_init_audio_decoder();
+  pipecat_init_audio_encoder();
+  
   pipecat_init_wifi();
   pipecat_init_webrtc();
 
   while (1) {
     pipecat_webrtc_loop();
+    pipecat_audio_process();
     vTaskDelay(pdMS_TO_TICKS(TICK_INTERVAL));
   }
 }
@@ -40,6 +45,7 @@ extern "C" void app_main(void) {
 int main(void) {
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   peer_init();
+  pipecat_init_audio_encoder();
   pipecat_webrtc();
 
   while (1) {

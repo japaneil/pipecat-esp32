@@ -1,6 +1,9 @@
 #include <peer.h>
 
-#ifndef LINUX_BUILD
+// Add BSP support
+#ifdef CONFIG_BSP_BOARD_M5STACK_CORE_S3
+#include "bsp/esp-bsp.h"
+#else
 #include <M5Unified.h>
 #endif
 
@@ -18,6 +21,7 @@ extern void pipecat_init_audio_decoder();
 extern void pipecat_init_audio_encoder();
 extern void pipecat_send_audio(PeerConnection *peer_connection);
 extern void pipecat_audio_decode(uint8_t *data, size_t size);
+extern void pipecat_audio_process();
 
 // WebRTC / Signalling
 extern void pipecat_init_webrtc();
