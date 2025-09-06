@@ -8,7 +8,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
-#define GAIN 1.0
+#define GAIN 3.0
 #define CHANNELS 1
 #define SAMPLE_RATE (16000)
 #define BITS_PER_SAMPLE 16
