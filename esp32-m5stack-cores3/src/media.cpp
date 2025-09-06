@@ -1,38 +1,30 @@
+#include "main.h"
 #include "bsp/esp-bsp.h"
 #include <atomic>
 #include <opus.h>
 #include <peer.h>
-#include "esp_log.h"
-#include "main.h"
-#include <queue>
-#include <vector>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
 
+#define GAIN 1.0
 #define CHANNELS 1
 #define SAMPLE_RATE (16000)
 #define BITS_PER_SAMPLE 16
-
-#define PCM_BUFFER_SIZE_BYTES 640
-#define PCM_BUFFER_SIZE_SAMPLES (PCM_BUFFER_SIZE_BYTES / sizeof(int16_t))
-
+#define PCM_BUFFER_SIZE 640
 #define OPUS_BUFFER_SIZE 1276
 #define OPUS_ENCODER_BITRATE 30000
 #define OPUS_ENCODER_COMPLEXITY 0
 
-// Simple packet queue - no complex threading
-#define MAX_AUDIO_PACKETS 20
-#define PLAYBACK_INTERVAL_MS 40  // Play audio every 40ms
+// Audio buffer settings
+#define AUDIO_BUFFER_SIZE (PCM_BUFFER_SIZE * 8)  // Buffer for multiple audio chunks
+#define AUDIO_CHUNK_SIZE (PCM_BUFFER_SIZE / 2)   // Size per audio chunk (320 samples)
 
-static const char *TAG = "pipecat_audio";
-
-// Simple audio packet structure
-struct AudioPacket {
-    std::vector<uint8_t> data;
-    uint32_t timestamp;
-};
-
+// Global variables
 esp_codec_dev_sample_info_t fs = {
-    .bits_per_sample = 16,
-    .channel = 1,
+    .bits_per_sample = BITS_PER_SAMPLE,
+    .channel = CHANNELS,
     .channel_mask = 0,
     .sample_rate = SAMPLE_RATE,
     .mclk_multiple = 0,
@@ -48,243 +40,211 @@ OpusEncoder *opus_encoder = NULL;
 uint8_t *encoder_output_buffer = NULL;
 uint8_t *read_buffer = NULL;
 
+// Audio buffer and task handles
+QueueHandle_t audio_queue;
+TaskHandle_t audio_playback_task_handle = NULL;
+SemaphoreHandle_t audio_mutex;
+
 std::atomic<bool> is_playing = false;
+std::atomic<bool> audio_system_running = true;
 
-// Simple packet queue - no complex synchronization needed
-std::queue<AudioPacket> audio_packet_queue;
-uint32_t last_playback_time = 0;
+// Audio chunk structure for queue
+typedef struct {
+    int16_t data[AUDIO_CHUNK_SIZE];
+    size_t size;
+    bool is_silence;
+} audio_chunk_t;
 
+// Helper function to detect if audio is playing
 void set_is_playing(int16_t *in_buf) {
     bool any_set = false;
-    for (size_t i = 0; i < PCM_BUFFER_SIZE_SAMPLES; i++) {
+    for (size_t i = 0; i < (PCM_BUFFER_SIZE / 2); i++) {
         if (in_buf[i] != -1 && in_buf[i] != 0 && in_buf[i] != 1) {
             any_set = true;
-            break;
         }
     }
     is_playing = any_set;
 }
 
+// Helper function to apply gain to audio samples
 void apply_gain(int16_t *samples) {
-    return; // Disabled
+    for (size_t i = 0; i < (PCM_BUFFER_SIZE / 2); i++) {
+        float scaled = (float)samples[i] * GAIN;
+
+        // Clamp to 16-bit range
+        if (scaled > 32767.0f)
+            scaled = 32767.0f;
+        if (scaled < -32768.0f)
+            scaled = -32768.0f;
+
+        samples[i] = (int16_t)scaled;
+    }
 }
 
+// Audio playback task - continuously streams audio to prevent gaps
+void pipecat_audio_playback_task(void *parameter) {
+    audio_chunk_t chunk;
+    int16_t silence_buffer[AUDIO_CHUNK_SIZE];
+    memset(silence_buffer, 0, sizeof(silence_buffer));
+    
+    TickType_t last_audio_time = xTaskGetTickCount();
+    const TickType_t silence_timeout = pdMS_TO_TICKS(100); // 100ms timeout
+    
+    ESP_LOGI(LOG_TAG, "Audio playback task started");
+    
+    while (audio_system_running) {
+        // Try to get audio from queue with short timeout
+        if (xQueueReceive(audio_queue, &chunk, pdMS_TO_TICKS(20)) == pdTRUE) {
+            // Got real audio data
+            set_is_playing(chunk.data);
+            esp_codec_dev_write(spk_codec_dev, chunk.data, chunk.size * sizeof(int16_t));
+            last_audio_time = xTaskGetTickCount();
+        } else {
+            // No audio data - check if we should play silence to prevent clicks
+            TickType_t current_time = xTaskGetTickCount();
+            if ((current_time - last_audio_time) < silence_timeout) {
+                // Play silence to maintain audio stream continuity
+                esp_codec_dev_write(spk_codec_dev, silence_buffer, sizeof(silence_buffer));
+            }
+            // After timeout, stop playing silence to save power
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1)); // Small delay
+    }
+    
+    vTaskDelete(NULL);
+}
+
+// Initialize audio capture (microphone)
 void pipecat_init_audio_capture() {
-    ESP_LOGI(TAG, ">>> BSP AUDIO INIT <<<");
-    
-    esp_err_t ret = bsp_i2c_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "BSP board init failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    spk_codec_dev = bsp_audio_codec_speaker_init();
-    if (spk_codec_dev == NULL) {
-        ESP_LOGE(TAG, "Failed to initialize speaker codec");
-        return;
-    }
-    
-    ret = esp_codec_dev_open(spk_codec_dev, &fs);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open speaker codec: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    ret = esp_codec_dev_set_out_vol(spk_codec_dev, 60);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set speaker volume: %s", esp_err_to_name(ret));
-    }
-
+    // Microphone
     mic_codec_dev = bsp_audio_codec_microphone_init();
-    if (mic_codec_dev == NULL) {
-        ESP_LOGE(TAG, "Failed to initialize microphone codec");
-        return;
-    }
+    esp_codec_dev_set_in_gain(mic_codec_dev, 42.0);
+    esp_codec_dev_open(mic_codec_dev, &fs);
     
-    ret = esp_codec_dev_set_in_gain(mic_codec_dev, 30.0);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set microphone gain: %s", esp_err_to_name(ret));
-    }
+    // Allocate read buffer for microphone
+    read_buffer = (uint8_t *)heap_caps_malloc(PCM_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
     
-    ret = esp_codec_dev_open(mic_codec_dev, &fs);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open microphone codec: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    ESP_LOGI(TAG, ">>> BSP AUDIO INIT COMPLETE <<<");
+    ESP_LOGI(LOG_TAG, "Audio capture initialized");
 }
 
+// Initialize audio decoder (speaker/playback)
 void pipecat_init_audio_decoder() {
-    ESP_LOGI(TAG, ">>> BSP OPUS DECODER INIT <<<");
-    
+    // Speaker
+    spk_codec_dev = bsp_audio_codec_speaker_init();
+    assert(spk_codec_dev);
+    esp_codec_dev_open(spk_codec_dev, &fs);
+    esp_codec_dev_set_out_vol(spk_codec_dev, 100);
+
+    // Opus Decoder
     int opus_error = 0;
     opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &opus_error);
-    if (opus_error != OPUS_OK) {
-        ESP_LOGE(TAG, "Failed to create OPUS decoder: %d", opus_error);
-        return;
-    }
+    assert(opus_error == OPUS_OK);
+    decoder_buffer = (opus_int16 *)malloc(PCM_BUFFER_SIZE);
     
-    opus_decoder_ctl(opus_decoder, OPUS_RESET_STATE);
-    opus_decoder_ctl(opus_decoder, OPUS_SET_GAIN(0));
+    // Create audio queue and mutex
+    audio_queue = xQueueCreate(8, sizeof(audio_chunk_t)); // Buffer 8 chunks
+    audio_mutex = xSemaphoreCreateMutex();
     
-    decoder_buffer = (opus_int16 *)malloc(PCM_BUFFER_SIZE_BYTES);
-    if (!decoder_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate decoder buffer");
-        return;
-    }
+    // Create audio playback task
+    xTaskCreate(pipecat_audio_playback_task, "audio_playback", 4096, NULL, 5, &audio_playback_task_handle);
     
-    ESP_LOGI(TAG, ">>> BSP OPUS DECODER READY <<<");
+    ESP_LOGI(LOG_TAG, "Audio decoder initialized");
 }
 
+// Initialize audio encoder
 void pipecat_init_audio_encoder() {
-    ESP_LOGI(TAG, ">>> BSP OPUS ENCODER INIT <<<");
-    
+    // Opus Encoder
     int opus_error = 0;
     opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_error);
-    if (opus_error != OPUS_OK) {
-        ESP_LOGE(TAG, "Failed to create OPUS encoder: %d", opus_error);
-        return;
-    }
-    
+    assert(opus_error == OPUS_OK);
+    assert(opus_encoder_init(opus_encoder, SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP) == OPUS_OK);
+
     opus_encoder_ctl(opus_encoder, OPUS_SET_BITRATE(OPUS_ENCODER_BITRATE));
     opus_encoder_ctl(opus_encoder, OPUS_SET_COMPLEXITY(OPUS_ENCODER_COMPLEXITY));
     opus_encoder_ctl(opus_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
 
-    read_buffer = (uint8_t *)heap_caps_malloc(PCM_BUFFER_SIZE_BYTES, MALLOC_CAP_DEFAULT);
     encoder_output_buffer = (uint8_t *)malloc(OPUS_BUFFER_SIZE);
     
-    if (!read_buffer || !encoder_output_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate encoder buffers");
-        return;
-    }
-    
-    ESP_LOGI(TAG, ">>> BSP OPUS ENCODER READY <<<");
+    ESP_LOGI(LOG_TAG, "Audio encoder initialized");
 }
 
-// Add packet to simple queue
-void pipecat_audio_decode(uint8_t *data, size_t size) {
-    // Skip DTX (silence) packets  
-    if (size <= 3) {
-        ESP_LOGD(TAG, "Skipping DTX packet (%d bytes)", size);
-        return;
-    }
-    
-    // Validate packet size
-    if (size < 10 || size > 400) {
-        ESP_LOGW(TAG, "Dropping suspicious packet: %d bytes", size);
-        return;
-    }
-    
-    // Drop packets if queue is full
-    if (audio_packet_queue.size() >= MAX_AUDIO_PACKETS) {
-        ESP_LOGW(TAG, "Audio queue full, dropping oldest packet");
-        audio_packet_queue.pop();
-    }
-    
-    // Add to queue
-    AudioPacket packet;
-    packet.data.assign(data, data + size);
-    packet.timestamp = esp_log_timestamp();
-    audio_packet_queue.push(packet);
-    
-    ESP_LOGD(TAG, "Queued packet: %d bytes (queue: %d)", size, audio_packet_queue.size());
-}
-
-// Process audio queue at regular intervals - focus on clean OPUS decoding
-void pipecat_audio_process() {
-    uint32_t current_time = esp_log_timestamp();
-    
-    // Only process audio at regular intervals
-    if (current_time - last_playback_time < PLAYBACK_INTERVAL_MS) {
-        return;
-    }
-    
-    if (audio_packet_queue.empty()) {
-        return;
-    }
-    
-    last_playback_time = current_time;
-    
-    // Get next packet
-    AudioPacket packet = audio_packet_queue.front();
-    audio_packet_queue.pop();
-    
-    ESP_LOGD(TAG, "Processing packet: %d bytes", packet.data.size());
-    
-    // Clear the buffer first to avoid artifacts
-    memset(decoder_buffer, 0, PCM_BUFFER_SIZE_BYTES);
-    
-    // Decode OPUS to PCM with Forward Error Correction
-    auto decoded_size = opus_decode(opus_decoder, 
-                                  packet.data.data(), 
-                                  packet.data.size(),
-                                  decoder_buffer, 
-                                  PCM_BUFFER_SIZE_SAMPLES, 
-                                  1);  // Enable FEC
-    
-    if (decoded_size <= 0) {
-        ESP_LOGW(TAG, "OPUS decode failed: %d", decoded_size);
-        return;
-    }
-    
-    // Check for decode artifacts - skip frames with too many extreme values
-    int extreme_count = 0;
-    for (int i = 0; i < decoded_size; i++) {
-        if (decoder_buffer[i] > 20000 || decoder_buffer[i] < -20000) {
-            extreme_count++;
-        }
-    }
-    
-    if (extreme_count > (decoded_size / 4)) {  // More than 25% extreme values
-        ESP_LOGW(TAG, "Skipping frame with %d extreme values", extreme_count);
-        return;
-    }
-    
-    // Light smoothing to reduce growling artifacts
-    for (int i = 1; i < decoded_size - 1; i++) {
-        int32_t smoothed = (decoder_buffer[i-1] + decoder_buffer[i] + decoder_buffer[i+1]) / 3;
-        decoder_buffer[i] = (int16_t)smoothed;
-    }
-    
-    ESP_LOGD(TAG, "Decoded %d samples (cleaned)", decoded_size);
-    
-    set_is_playing(decoder_buffer);
-    apply_gain(decoder_buffer);
-    
-    // Play the audio
-    size_t bytes_to_write = decoded_size * sizeof(int16_t);
-    esp_err_t ret = esp_codec_dev_write(spk_codec_dev, decoder_buffer, bytes_to_write);
-    
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Speaker write failed: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGD(TAG, "Played %d samples successfully", decoded_size);
-    }
-}
-
-// Keep original microphone logic - this was working
+// Send audio data (encode and send via WebRTC)
 void pipecat_send_audio(PeerConnection *peer_connection) {
     if (is_playing) {
-        memset(read_buffer, 0, PCM_BUFFER_SIZE_BYTES);
+        // If audio is playing, send silence to avoid echo
+        memset(read_buffer, 0, PCM_BUFFER_SIZE);
     } else {
-        esp_err_t ret = esp_codec_dev_read(mic_codec_dev, read_buffer, PCM_BUFFER_SIZE_BYTES);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Microphone read failed: %s", esp_err_to_name(ret));
-            memset(read_buffer, 0, PCM_BUFFER_SIZE_BYTES);
-        }
+        // Read from microphone
+        ESP_ERROR_CHECK(esp_codec_dev_read(mic_codec_dev, read_buffer, PCM_BUFFER_SIZE));
     }
 
-    auto encoded_size = opus_encode(opus_encoder, 
-                                  (const opus_int16 *)read_buffer,
-                                  PCM_BUFFER_SIZE_SAMPLES,
-                                  encoder_output_buffer, 
-                                  OPUS_BUFFER_SIZE);
+    // Encode audio with Opus
+    auto encoded_size = opus_encode(opus_encoder, (const opus_int16 *)read_buffer,
+                                    PCM_BUFFER_SIZE / sizeof(uint16_t),
+                                    encoder_output_buffer, OPUS_BUFFER_SIZE);
     
-    if (encoded_size > 0) {
-        peer_connection_send_audio(peer_connection, encoder_output_buffer, encoded_size);
-        ESP_LOGD(TAG, "Sent %d bytes to peer", encoded_size);
-    } else {
-        ESP_LOGW(TAG, "OPUS encode failed: %d", encoded_size);
+    // Send encoded audio via WebRTC
+    peer_connection_send_audio(peer_connection, encoder_output_buffer, encoded_size);
+}
+
+// Decode and queue received audio - now non-blocking
+void pipecat_audio_decode(uint8_t *data, size_t size) {
+    auto decoded_size = opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE / 2, 0);
+
+    if (decoded_size > 0) {
+        apply_gain((int16_t *)decoder_buffer);
+        
+        // Create audio chunk
+        audio_chunk_t chunk;
+        chunk.size = decoded_size;
+        chunk.is_silence = false;
+        
+        // Copy decoded audio to chunk
+        memcpy(chunk.data, decoder_buffer, decoded_size * sizeof(int16_t));
+        
+        // Try to queue the audio (non-blocking)
+        if (xQueueSend(audio_queue, &chunk, 0) != pdTRUE) {
+            // Queue full - drop oldest and try again
+            audio_chunk_t dummy;
+            xQueueReceive(audio_queue, &dummy, 0);
+            xQueueSend(audio_queue, &chunk, 0);
+            ESP_LOGW(LOG_TAG, "Audio queue full, dropped frame");
+        }
+    }
+}
+
+// Cleanup function
+void pipecat_audio_cleanup() {
+    audio_system_running = false;
+    
+    if (audio_playback_task_handle) {
+        vTaskDelete(audio_playback_task_handle);
+        audio_playback_task_handle = NULL;
+    }
+    
+    if (audio_queue) {
+        vQueueDelete(audio_queue);
+        audio_queue = NULL;
+    }
+    
+    if (audio_mutex) {
+        vSemaphoreDelete(audio_mutex);
+        audio_mutex = NULL;
+    }
+    
+    if (decoder_buffer) {
+        free(decoder_buffer);
+        decoder_buffer = NULL;
+    }
+    
+    if (encoder_output_buffer) {
+        free(encoder_output_buffer);
+        encoder_output_buffer = NULL;
+    }
+    
+    if (read_buffer) {
+        heap_caps_free(read_buffer);
+        read_buffer = NULL;
     }
 }
