@@ -96,6 +96,12 @@ void pipecat_http_request(char *offer, char *answer) {
     ESP_LOGE(LOG_TAG, "Unable to create JSON offer");
     return;
   }
+  // Add device_id field
+  if (cJSON_AddStringToObject(j_offer, "device_id", "ESPX3001") == NULL) {
+    cJSON_Delete(j_offer);
+    ESP_LOGE(LOG_TAG, "Unable to create JSON offer");
+    return;
+  }
 
   ESP_LOGD(LOG_TAG, "OFFER\n%s", offer);
 
