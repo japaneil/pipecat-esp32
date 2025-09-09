@@ -8,7 +8,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
-#define GAIN 3.0
+#define GAIN 10.0
 #define CHANNELS 1
 #define SAMPLE_RATE (16000)
 #define BITS_PER_SAMPLE 16
@@ -20,6 +20,9 @@
 // Audio buffer settings
 #define AUDIO_BUFFER_SIZE (PCM_BUFFER_SIZE * 8)  // Buffer for multiple audio chunks
 #define AUDIO_CHUNK_SIZE (PCM_BUFFER_SIZE / 2)   // Size per audio chunk (320 samples)
+
+// Audio Volume settings
+#define SPEAKER_SET_OUT_VOLUME 255
 
 // Global variables
 esp_codec_dev_sample_info_t fs = {
@@ -134,7 +137,7 @@ void pipecat_init_audio_decoder() {
     spk_codec_dev = bsp_audio_codec_speaker_init();
     assert(spk_codec_dev);
     esp_codec_dev_open(spk_codec_dev, &fs);
-    esp_codec_dev_set_out_vol(spk_codec_dev, 100);
+    esp_codec_dev_set_out_vol(spk_codec_dev, SPEAKER_SET_OUT_VOLUME);
 
     // Opus Decoder
     int opus_error = 0;
