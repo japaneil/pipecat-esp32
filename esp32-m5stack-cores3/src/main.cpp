@@ -30,10 +30,11 @@ extern "C" void app_main(void) {
   // Initialize audio components in correct order
   pipecat_init_audio_capture();
   pipecat_init_audio_decoder();
-  pipecat_init_audio_encoder();
+  // Note: pipecat_init_audio_encoder() is called later in the audio task
   
-  pipecat_init_wifi();
-  pipecat_init_webrtc();
+  // Use optimized WiFi and WebRTC initialization
+  pipecat_init_wifi();        // This is your optimized WiFi code
+  pipecat_init_webrtc();      // This is your optimized WebRTC code
 
   while (1) {
     pipecat_webrtc_loop();

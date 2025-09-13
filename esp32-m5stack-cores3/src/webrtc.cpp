@@ -13,12 +13,22 @@ static PeerConnection *peer_connection = NULL;
 
 #ifndef LINUX_BUILD
 StaticTask_t task_buffer;
+
+// Pre-allocate buffer to avoid malloc in critical path
+static char *http_response_buffer = NULL;
+
 void pipecat_send_audio_task(void *user_data) {
   pipecat_init_audio_encoder();
+  
+  // Set high priority and pin to core for consistent timing
+  vTaskPrioritySet(NULL, configMAX_PRIORITIES - 2);
+  
+  TickType_t last_wake_time = xTaskGetTickCount();
+  const TickType_t frequency = pdMS_TO_TICKS(TICK_INTERVAL);
 
   while (1) {
+    vTaskDelayUntil(&last_wake_time, frequency); // More precise timing
     pipecat_send_audio(peer_connection);
-    vTaskDelay(pdMS_TO_TICKS(TICK_INTERVAL));
   }
 }
 #endif
@@ -49,27 +59,44 @@ static void pipecat_onconnectionstatechange_task(PeerConnectionState state,
   if (state == PEER_CONNECTION_DISCONNECTED ||
       state == PEER_CONNECTION_CLOSED) {
 #ifndef LINUX_BUILD
+    // Clean shutdown before restart
+    if (http_response_buffer) {
+      heap_caps_free(http_response_buffer);
+      http_response_buffer = NULL;
+    }
     esp_restart();
 #endif
   } else if (state == PEER_CONNECTION_CONNECTED) {
 #ifndef LINUX_BUILD
+    // Pre-allocate HTTP buffer to avoid malloc during critical operations
+    if (!http_response_buffer) {
+      http_response_buffer = (char *)heap_caps_malloc(MAX_HTTP_OUTPUT_BUFFER + 1, MALLOC_CAP_DMA);
+    }
+    
+    // Use DMA memory for task stack for better performance
     StackType_t *stack_memory = (StackType_t *)heap_caps_malloc(
-        30000 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    xTaskCreateStaticPinnedToCore(pipecat_send_audio_task, "audio_publisher",
-                                  30000, NULL, 7, stack_memory, &task_buffer,
-                                  0);
+        25000 * sizeof(StackType_t), MALLOC_CAP_DMA); // Reduced stack size
+    
+    // Pin audio task to core 0 (opposite of WiFi core) for better isolation
+    xTaskCreateStaticPinnedToCore(pipecat_send_audio_task, "audio_pub",
+                                  25000, NULL, configMAX_PRIORITIES - 2, 
+                                  stack_memory, &task_buffer, 0);
     pipecat_init_rtvi(peer_connection, &pipecat_rtvi_callbacks);
 #endif
   }
 }
 
 static void pipecat_on_icecandidate_task(char *description, void *user_data) {
-  char *local_buffer = (char *)malloc(MAX_HTTP_OUTPUT_BUFFER + 1);
-  memset(local_buffer, 0, MAX_HTTP_OUTPUT_BUFFER + 1);
-  pipecat_http_request(description, local_buffer);
-  peer_connection_set_remote_description(peer_connection, local_buffer,
+  // Use pre-allocated buffer instead of malloc
+  if (!http_response_buffer) {
+    http_response_buffer = (char *)heap_caps_malloc(MAX_HTTP_OUTPUT_BUFFER + 1, MALLOC_CAP_DMA);
+  }
+  
+  memset(http_response_buffer, 0, MAX_HTTP_OUTPUT_BUFFER + 1);
+  pipecat_http_request(description, http_response_buffer);
+  peer_connection_set_remote_description(peer_connection, http_response_buffer,
                                          SDP_TYPE_ANSWER);
-  free(local_buffer);
+  // Don't free - keep buffer allocated for reuse
 }
 
 void pipecat_init_webrtc() {
@@ -80,6 +107,7 @@ void pipecat_init_webrtc() {
       .datachannel = DATA_CHANNEL_STRING,
       .onaudiotrack = [](uint8_t *data, size_t size, void *userdata) -> void {
 #ifndef LINUX_BUILD
+        // Process audio on same core to reduce context switching
         pipecat_audio_decode(data, size);
 #endif
       },
@@ -108,4 +136,12 @@ void pipecat_init_webrtc() {
 
 void pipecat_webrtc_loop() {
   peer_connection_loop(peer_connection);
+}
+
+// Cleanup function
+void pipecat_webrtc_cleanup() {
+  if (http_response_buffer) {
+    heap_caps_free(http_response_buffer);
+    http_response_buffer = NULL;
+  }
 }
